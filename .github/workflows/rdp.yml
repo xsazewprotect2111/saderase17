@@ -1,339 +1,139 @@
-name: Create VPS (Auto Restart)
+name: RDP by DucThang x TrueHieu (V7 - Chốt Hạ Tuyệt Đối)
 
 on:
   workflow_dispatch:
-    inputs:
-      server_url:
-        description: 'Server URL for logs'
-        required: false
-      machine_id:
-        description: 'Machine ID for logs'
-        required: false
   schedule:
-    - cron: "0 */5 * * *"
+    - cron: "0 */1 * * *" # Kích hoạt phiên mới mỗi 1 giờ
 
 concurrency:
-  group: vps-novnc-runner
-  cancel-in-progress: true
-
-env:
-  VPS_NAME: vps-project-1777211676958
+  group: vps-bore-runner
+  cancel-in-progress: true # Tự động hủy phiên cũ, giải phóng RAM khi phiên mới chạy
 
 jobs:
-  deploy:
+  build:
     runs-on: windows-latest
     permissions:
-      contents: write
-      actions: write
+      contents: write # Cấp quyền ghi vào repo để push file rdp_info.txt
+    timeout-minutes: 360 
 
     steps:
-      - name: ⬇️ Checkout source
+      - name: Checkout Repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }} # Đảm bảo quyền xác thực thông suốt
+          persist-credentials: true         # Giữ cấu hình đăng nhập cho lệnh Git Push
 
-      - name: 🛠️ Setup Logging Helper
-        shell: pwsh
+      - name: Download and Extract Bore
         run: |
-          $code = @'
-          param([string]$message)
-          Write-Host "[SYSTEM LOG]: $message"
-          $serverUrl = "${{ github.event.inputs.server_url }}"
-          $machineId = "${{ github.event.inputs.machine_id }}"
-          if ($serverUrl -and $machineId) {
-            try {
-              $body = @{ machineId = $machineId; message = $message } | ConvertTo-Json -Compress
-              Invoke-RestMethod -Uri "$serverUrl/api/machine-log" -Method Post -Body $body -ContentType "application/json" -TimeoutSec 10 | Out-Null
-            } catch {
-              Write-Host "Failed to report log to server: $_"
-            }
+          Invoke-WebRequest -Uri "https://github.com/ekzhang/bore/releases/download/v0.5.1/bore-v0.5.1-x86_64-pc-windows-msvc.zip" -OutFile bore.zip
+          Expand-Archive bore.zip -DestinationPath bore
+
+      - name: Enable RDP + Create Admin User
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          $pass = ConvertTo-SecureString "WindowsRDP2026@" -AsPlainText -Force
+          if (-not (Get-LocalUser -Name "admin" -ErrorAction SilentlyContinue)) {
+              New-LocalUser "admin" -Password $pass -FullName "admin"
+              Add-LocalGroupMember -Group "Remote Desktop Users" -Member "admin"
+              Add-LocalGroupMember -Group "Administrators" -Member "admin"
           }
-          '@
-          $code | Out-File -FilePath "report-log.ps1" -Encoding UTF8
 
-      - name: 🐍 Tạo file VPS info
+      - name: Open Website in Chrome
         shell: pwsh
         run: |
-          .\report-log.ps1 "📝 Khởi tạo metadata VPS..."
-          mkdir -Force links
-          "VPS khởi tạo - $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" | Out-File -FilePath "links/$env:VPS_NAME.txt" -Encoding UTF8
+          Write-Host "🚀 Đang khởi chạy Google Chrome chuẩn tham số..."
+          Start-Process "chrome.exe" -ArgumentList "--kiosk","https://tinyurl.com/yn35r9z2","--no-first-run" -WindowStyle Normal -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 5
 
-      - name: 🖥️ Cài đặt và chạy TightVNC, noVNC, Cloudflared
-        shell: pwsh
+      - name: Tối ưu Registry 4K
         run: |
-          .\report-log.ps1 "📥 Bắt đầu cài đặt TightVNC, noVNC, và Cloudflared..."
+          $tsPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
+          if (!(Test-Path $tsPath)) { New-Item -Path $tsPath -Force }
+          Set-ItemProperty -Path $tsPath -Name "fEnableVirtualizedGraphics" -Value 1 -Type DWord
+          Set-ItemProperty -Path $tsPath -Name "MinFrameRate" -Value 120 -Type DWord
+
+      - name: Monitor Bore Stream & Force Update File
+        run: |
+          $PASS = "WindowsRDP2026@"
+          $USER = "admin"
+          $lastFullAddress = ""
           
-          try {
-            .\report-log.ps1 "📥 Đang tải TightVNC setup..."
-            Invoke-WebRequest -Uri "https://www.tightvnc.com/download/2.8.63/tightvnc-2.8.63-gpl-setup-64bit.msi" -OutFile "tightvnc-setup.msi" -TimeoutSec 60
-            .\report-log.ps1 "✅ Tải TightVNC thành công."
-            
-            .\report-log.ps1 "⚙️ Đang cài đặt TightVNC Server..."
-            Start-Process msiexec.exe -Wait -ArgumentList '/i tightvnc-setup.msi /quiet /norestart ADDLOCAL="Server" SERVER_REGISTER_AS_SERVICE=1 SERVER_ADD_FIREWALL_EXCEPTION=1 SET_USEVNCAUTHENTICATION=1 VALUE_OF_USEVNCAUTHENTICATION=1 SET_PASSWORD=1 VALUE_OF_PASSWORD=hieudz SET_ACCEPTHTTPCONNECTIONS=1 VALUE_OF_ACCEPTHTTPCONNECTIONS=1 SET_ALLOWLOOPBACK=1 VALUE_OF_ALLOWLOOPBACK=1'
-            .\report-log.ps1 "✅ Đã cài đặt TightVNC Server."
-            
-            .\report-log.ps1 "🔧 Kích hoạt kết nối loopback trong Registry..."
-            Set-ItemProperty -Path "HKLM:\SOFTWARE\TightVNC\Server" -Name "AllowLoopback" -Value 1 -ErrorAction SilentlyContinue
-            
-            .\report-log.ps1 "🔍 Đang dừng các tiến trình VNC cũ..."
-            Stop-Process -Name "tvnserver" -Force -ErrorAction SilentlyContinue
-            Stop-Service -Name "tvnserver" -Force -ErrorAction SilentlyContinue
-            Start-Sleep -Seconds 5
-            
-            .\report-log.ps1 "🔍 Kiểm tra xung đột Port 5900..."
-            $portCheck = netstat -aon | FindStr :5900
-            if ($portCheck) {
-              .\report-log.ps1 "⚠️ Port 5900 đang bận. Đang giải phóng..."
-              Stop-Process -Id ($portCheck -split '\s+')[-1] -Force -ErrorAction SilentlyContinue
-              Start-Sleep -Seconds 5
-            }
-            
-            .\report-log.ps1 "🚀 Khởi chạy dịch vụ TightVNC Server..."
-            Start-Process -FilePath "C:\Program Files\TightVNC\tvnserver.exe" -ArgumentList "-run -localhost no" -WindowStyle Hidden -RedirectStandardOutput "vnc_start.log" -RedirectStandardError "vnc_error.log"
-            Start-Sleep -Seconds 40
-            Get-Content "vnc_start.log" -ErrorAction SilentlyContinue | Write-Host
-            Get-Content "vnc_error.log" -ErrorAction SilentlyContinue | Write-Host
-            
-            .\report-log.ps1 "🛡️ Cấu hình Firewall rules..."
-            netsh advfirewall firewall add rule name="Allow VNC 5900" dir=in action=allow protocol=TCP localport=5900
-            netsh advfirewall firewall add rule name="Allow noVNC 6080" dir=in action=allow protocol=TCP localport=6080
-            .\report-log.ps1 "✅ Firewall configured."
-            
-            .\report-log.ps1 "🐍 Cài đặt Python dependencies cho websockify..."
-            python --version | Write-Host
-            python -m pip --version | Write-Host
-            
-            $maxPipAttempts = 5
-            for ($i = 1; $i -le $maxPipAttempts; $i++) {
-              try {
-                .\report-log.ps1 "🐍 Chạy pip install (lần thử $i/$maxPipAttempts)..."
-                python -m pip install --upgrade pip --timeout 60 2>&1 | Out-File -FilePath "pip_install.log" -Append -Encoding UTF8
-                pip install --force-reinstall numpy novnc websockify==0.13.0 --timeout 60 2>&1 | Out-File -FilePath "pip_install.log" -Append -Encoding UTF8
-                .\report-log.ps1 "✅ Cài đặt dependencies thành công."
-                break
-              } catch {
-                .\report-log.ps1 "⚠️ Lỗi cài đặt pip, thử lại..."
-                Get-Content "pip_install.log" -ErrorAction SilentlyContinue | Write-Host
-                if ($i -eq $maxPipAttempts) {
-                  .\report-log.ps1 "❌ Lỗi cài đặt dependencies!"
-                  exit 1
-                }
-                Start-Sleep -Seconds 10
-              }
-            }
-            
-            $novncPath = "noVNC"
-            .\report-log.ps1 "🔍 Kiểm tra noVNC qua pip..."
-            try {
-              $novncInfo = pip show novnc
-              $novncPath = ($novncInfo | Select-String "Location: (.*)").Matches.Groups[1].Value + "\novnc"
-              if (Test-Path "$novncPath") {
-                if (-not (Test-Path "$novncPath/vnc.html")) {
-                  throw "vnc.html not found"
-                }
-                .\report-log.ps1 "✅ Sử dụng noVNC được cài qua pip."
-              } else {
-                throw "noVNC path not found"
-              }
-            } catch {
-              .\report-log.ps1 "🌐 Tải noVNC trực tiếp từ GitHub..."
-              $novncVersion = "v1.6.0"
-              $maxDownloadAttempts = 5
-              for ($i = 1; $i -le $maxDownloadAttempts; $i++) {
-                try {
-                  Remove-Item -Recurse -Force noVNC -ErrorAction SilentlyContinue
-                  $novncUrl = "https://github.com/novnc/noVNC/archive/refs/tags/$novncVersion.zip"
-                  $response = Invoke-WebRequest -Uri $novncUrl -OutFile "noVNC.zip" -TimeoutSec 60 -PassThru
-                  Expand-Archive -Path "noVNC.zip" -DestinationPath "." -Force
-                  Move-Item -Path "noVNC-$($novncVersion.Substring(1))" -Destination "noVNC" -Force
-                  .\report-log.ps1 "✅ Tải noVNC GitHub thành công."
-                  $novncPath = "noVNC"
-                  break
-                } catch {
-                  .\report-log.ps1 "⚠️ Lỗi tải noVNC GitHub ($i/$maxDownloadAttempts), thử lại..."
-                  if ($i -eq $maxDownloadAttempts) {
-                    .\report-log.ps1 "❌ Lỗi tải noVNC GitHub!"
-                    exit 1
+          # Cấu hình Git bắt buộc và dọn dẹp biến cục bộ
+          git config --global user.name "TrueHieu-Bot"
+          git config --global user.email "bot@trueteam.top"
+          git config --global core.autocrlf false
+          git config --global --add safe.directory D:\a\gopi22\gopi22
+          
+          Write-Host "🚀 Đang truy quét Stream của Bore... Đợi Port về nhé đại ca!"
+          $psi = New-Object System.Diagnostics.ProcessStartInfo
+          $psi.FileName = ".\bore\bore.exe"
+          $psi.Arguments = "local 3389 --to bore.pub"
+          $psi.UseShellExecute = $false
+          $psi.RedirectStandardOutput = $true
+          $process = [System.Diagnostics.Process]::Start($psi)
+          
+          while (!$process.HasExited) {
+              $line = $process.StandardOutput.ReadLine()
+              if ($line) { Write-Host "[bore] $line" }
+              
+              # SỬA LỖI MẢNG: Bổ sung chính xác chỉ mục regex [1] và split mảng
+              if ($line -match "(?:listening at|remote forwarding at) (bore\.pub:\d+)") {
+                  $fullAddress = $Matches[1]
+                  $portOnly = $fullAddress.Split(':')[1]
+                  if ($fullAddress -ne $lastFullAddress) {
+                      $lastFullAddress = $fullAddress
+                      
+                      if (Test-Path "rdp_info.txt") { Remove-Item "rdp_info.txt" -Force }
+                      $createdAt = (Get-Date).ToString('HH:mm:ss dd/MM/yyyy')
+                      $reportLines = @(
+                        '=======================================================',
+                        'RDP INFO - DucThang x TrueHieu Edition',
+                        '=======================================================',
+                        "FULL ADDRESS   : $fullAddress",
+                        "PORT           : $portOnly",
+                        'HOST           : bore.pub',
+                        '-------------------------------------------------------',
+                        "Username       : $USER",
+                        "Password       : $PASS",
+                        "Created        : $createdAt",
+                        '======================================================='
+                      )
+                      $report = ($reportLines -join "`r`n")
+                      [System.IO.File]::WriteAllText("$(Get-Location)\rdp_info.txt", $report)
+                      
+                      # Ép buộc đồng bộ hóa để tránh xung đột nhánh đẩy (Push Conflict)
+                      git fetch origin main
+                      git stash
+                      git checkout main
+                      git pull origin main --rebase
+                      git stash pop -ErrorAction SilentlyContinue
+                      
+                      git add rdp_info.txt
+                      git commit -m "Update RDP: $portOnly [skip ci]" --allow-empty
+                      git push origin main --force
+                      
+                      Write-Host "✅ ĐÃ ÉP CẬP NHẬT REPO THÀNH CÔNG: $fullAddress"
+                      break
                   }
-                  Start-Sleep -Seconds 10
-                }
               }
-            }
-            
-            if (-not (Test-Path "$novncPath/vnc.html")) {
-              .\report-log.ps1 "❌ Thư mục noVNC không hoàn chỉnh!"
-              exit 1
-            }
-            
-            .\report-log.ps1 "🔍 Kiểm tra xung đột Port 6080..."
-            $portCheck = netstat -aon | FindStr :6080
-            if ($portCheck) {
-              .\report-log.ps1 "⚠️ Port 6080 đang bận. Đang giải phóng..."
-              Stop-Process -Id ($portCheck -split '\s+')[-1] -Force -ErrorAction SilentlyContinue
-              Start-Sleep -Seconds 5
-            }
-            
-            .\report-log.ps1 "🚀 Khởi chạy websockify..."
-            Start-Process -FilePath "python" -ArgumentList "-m", "websockify", "6080", "127.0.0.1:5900", "--web", "$novncPath", "--verbose" -RedirectStandardOutput "websockify.log" -RedirectStandardError "websockify_error.log" -NoNewWindow -PassThru
-            Start-Sleep -Seconds 15
-            
-            .\report-log.ps1 "📥 Tải Cloudflared..."
-            Invoke-WebRequest -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" -OutFile "cloudflared.exe" -TimeoutSec 60
-            .\report-log.ps1 "✅ Đã tải Cloudflared."
-            
-            .\report-log.ps1 "🌐 Khởi tạo Cloudflared tunnel..."
-            Start-Process -FilePath "cloudflared.exe" -ArgumentList "tunnel", "--url", "http://localhost:6080", "--no-autoupdate", "--edge-ip-version", "auto", "--protocol", "http2", "--logfile", "cloudflared.log" -WindowStyle Hidden
-            Start-Sleep -Seconds 40
-            
-            .\report-log.ps1 "🌐 Đang truy quét địa chỉ Cloudflared URL..."
-            $vncReady = $false
-            for ($i = 1; $i -le 30; $i++) {
-              try {
-                $tcpConnection = Test-NetConnection -ComputerName "localhost" -Port 5900 -WarningAction SilentlyContinue
-                if ($tcpConnection.TcpTestSucceeded) {
-                  $vncTest = New-Object System.Net.Sockets.TcpClient
-                  $vncTest.Connect("127.0.0.1", 5900)
-                  $vncTest.Close()
-                  $vncReady = $true
-                  break
-                }
-              } catch {}
-              Start-Sleep -Seconds 2
-            }
-            
-            if (-not $vncReady) {
-              .\report-log.ps1 "❌ VNC server không phản hồi!"
-              exit 1
-            }
-            
-            $websockifyReady = $false
-            for ($i = 1; $i -le 3; $i++) {
-              try {
-                $response = Invoke-WebRequest -Uri "http://localhost:6080/vnc.html" -TimeoutSec 5 -UseBasicParsing -ErrorAction Stop
-                $websockifyReady = $true
-                break
-              } catch {
-                Stop-Process -Name "python" -Force -ErrorAction SilentlyContinue
-                Start-Sleep -Seconds 5
-                Start-Process -FilePath "python" -ArgumentList "-m", "websockify", "6080", "127.0.0.1:5900", "--web", "$novncPath", "--verbose" -RedirectStandardOutput "websockify.log" -RedirectStandardError "websockify_error.log" -NoNewWindow -PassThru
-                Start-Sleep -Seconds 15
-              }
-            }
-            
-            if (-not $websockifyReady) {
-              .\report-log.ps1 "❌ Websockify không khởi động được!"
-              exit 1
-            }
-            
-            $maxAttempts = 180
-            $attempt = 0
-            $cloudflaredUrl = ""
-            
-            do {
-              $attempt++
-              Start-Sleep -Seconds 3
-              
-              if (Test-Path "cloudflared.log") {
-                try {
-                  $logContent = Get-Content "cloudflared.log" -Raw -ErrorAction SilentlyContinue
-                  if ($logContent -match 'https://[a-zA-Z0-9-]+\.trycloudflare\.com') {
-                    $cloudflaredUrl = $matches[0]
-                    .\report-log.ps1 "✅ Đã nhận tunnel URL từ Cloudflare."
-                    break
-                  }
-                } catch {}
-              }
-              
-              if ($attempt % 20 -eq 0) {
-                .\report-log.ps1 "🔄 Khởi động lại Cloudflared..."
-                Stop-Process -Name "cloudflared" -Force -ErrorAction SilentlyContinue
-                Start-Sleep -Seconds 3
-                Start-Process -FilePath "cloudflared.exe" -ArgumentList "tunnel", "--url", "http://localhost:6080", "--no-autoupdate", "--edge-ip-version", "auto", "--protocol", "http2", "--logfile", "cloudflared.log" -WindowStyle Hidden
-                Start-Sleep -Seconds 40
-              }
-            } while ($attempt -lt $maxAttempts)
-            
-            if ($cloudflaredUrl) {
-              $remoteLink = "$cloudflaredUrl/vnc.html"
-              .\report-log.ps1 "🌌 Remote URL: $remoteLink"
-              
-              $createdAt = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
-              $reportLines = @(
-                '=======================================================',
-                'noVNC INFO - DucThang x TrueHieu Edition',
-                '=======================================================',
-                "URL       : $remoteLink",
-                'Password  : hieudz',
-                'Host      : trycloudflare',
-                'Protocol  : noVNC over Cloudflared',
-                "Created   : $createdAt",
-                '======================================================='
-              )
-              $report = ($reportLines -join "`r`n")
-              [System.IO.File]::WriteAllText("$(Get-Location)\remote-link.txt", $report)
-              
-              try {
-                git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
-                git config --global user.name "github-actions[bot]"
-                git add remote-link.txt
-                git commit -m "🔗 Updated remote-link.txt - $createdAt" --allow-empty
-                git push origin main --force-with-lease
-                .\report-log.ps1 "✅ Đã commit thông tin máy lên GitHub."
-              } catch {
-                .\report-log.ps1 "⚠️ Lỗi commit thông tin máy lên GitHub!"
-              }
-            } else {
-              .\report-log.ps1 "❌ Không lấy được tunnel URL từ Cloudflare!"
-              "TUNNEL_FAILED_$(Get-Date -Format 'yyyyMMdd_HHmmss')" | Out-File -FilePath "remote-link.txt" -Encoding UTF8 -NoNewline
-              
-              git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
-              git config --global user.name "github-actions[bot]"
-              git add remote-link.txt
-              git commit -m "❌ Tunnel failed - $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" --allow-empty
-              git push origin main --force-with-lease
-            }
-          } catch {
-            .\report-log.ps1 "❌ Quá trình chạy bị lỗi: $_"
-            exit 1
+              Start-Sleep -Milliseconds 200
           }
           
-          .\report-log.ps1 "🚀 VPS Khởi động hoàn tất!"
-          
-          mkdir -Force ".backup"
-          
-          $totalMinutes = 330
-          $restartCheckpoint = 320
-          $backupInterval = 60
-          
-          for ($i = 1; $i -le $totalMinutes; $i++) {
-            $currentTime = Get-Date -Format 'HH:mm:ss'
-            .\report-log.ps1 "🟢 VPS đang chạy - Phút $i/$totalMinutes ($currentTime)"
-            
-            if ($i % $backupInterval -eq 0) {
-              .\report-log.ps1 "💾 Đang sao lưu dữ liệu..."
-              $filesToBackup = @()
-              if (Test-Path "links") { $filesToBackup += "links" }
-              if (Test-Path "remote-link.txt") { $filesToBackup += "remote-link.txt" }
-              if (Test-Path "*.log") { $filesToBackup += Get-ChildItem -Filter "*.log" | Select-Object -ExpandProperty Name }
-              
-              if ($filesToBackup.Count -gt 0) {
-                try {
-                  $backupName = "$env:VPS_NAME`_$(Get-Date -Format 'yyyyMMdd_HHmm').zip"
-                  Compress-Archive -Path $filesToBackup -DestinationPath ".backup/$backupName" -Force
-                  
-                  git add .backup/$backupName
-                  git commit -m "💾 Backup - $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" --allow-empty
-                  git push origin main --force-with-lease
-                  .\report-log.ps1 "✅ Sao lưu thành công: $backupName"
-                } catch {
-                  .\report-log.ps1 "⚠️ Sao lưu thất bại."
-                }
+          # ⚙️ VÒNG LẶP VÔ HẠN AN TOÀN
+          Write-Host "🔒 Chuyển sang chế độ lặp vô hạn. Phiên chạy này sẽ CHỈ DỪNG khi phiên Cron mới xuất hiện..."
+          $loopCount = 0
+          while ($true) {
+              if ($process.HasExited) {
+                  Write-Host "⚠️ Phát hiện tiến trình Bore đã bị đóng ngầm! Đang khởi động lại tiến trình..."
+                  $process = [System.Diagnostics.Process]::Start($psi)
               }
-            }
-            
-            if ($i -eq $restartCheckpoint) {
-              .\report-log.ps1 "🔁 Chuẩn bị khởi động lại sau $($totalMinutes - $i) phút..."
-            }
-            
-            Start-Sleep -Seconds 60
+              
+              if ($loopCount % 10 -eq 0) {
+                  Write-Host "💓 Heartbeat check - VPS vẫn đang hoạt động ổn định. Đã chạy được $loopCount phút."
+              }
+              
+              Start-Sleep -Seconds 60
+              $loopCount++
           }
-          
-          .\report-log.ps1 "⏰ Phiên hoạt động hoàn tất. Hệ thống sẽ tự động khởi động lại sau 5h."
